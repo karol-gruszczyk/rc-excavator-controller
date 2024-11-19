@@ -12,7 +12,7 @@
 #define TEMPERATURE_NOMINAL 25
 #define B_COEFFICIENT 3950
 #define THERMISTOR_SERIES_RESISTOR 10000
-#define THERMISTOR_NUM_SAMPLES 10
+#define THERMISTOR_NUM_SAMPLES 5
 #define THERMISTOR_MIN_TEMP 0
 #define THERMISTOR_MAX_TEMP 100
 
@@ -32,43 +32,70 @@ volatile long servo_start_timer[] = {0, 0, 0, 0, 0, 0, 0};
 volatile long servo_end_timer[] = {0, 0, 0, 0, 0, 0, 0};
 
 //bool throttle_mode = THROTTLE_MODE_AUTO;
-bool discard_throttle_value = true;  // before accepting any input value, it needs to read 0 first
 float motor_throttle = 0; // 0.0 - 1.0
 
-bool temperature_value_out_of_bounds = false;
 float oil_temperature = 0.0;
 float thermistor_reading = 0.0;
-float fan_speed = 0.0; // 0.0-1.0
+float fan_speed = 0.0; // 0.0<>1.0
+
+#define ERROR_CODE_BLINK_DELAY 250
+#define ERROR_CODE_CYCLE_DELAY 1000
+#define ERROR_CODE_CYCLE_RESTART_DELAY 3000
+
+#define ERROR_CODE_BITS 8
+#define ERROR_CODE_THROTTLE_INIT_VALUE 0  // before accepting any input value, it needs to read 0 first
+#define ERROR_CODE_THERMISTOR_RANGE 1
+
+uint8_t error_codes_set = 0;  // each bit is an individual error code
+uint8_t current_error_bit = 0;
+uint8_t current_error_blink_counter = 0;
+volatile long error_timer = 0;
+
 
 void setup() {
-    dac.setVoltage(0, false);
+    Serial.begin(9600);
+    Serial.println("Init");
 
 //  pinMode(SERVO_1_PIN, INPUT_PULLUP);
 //  pinMode(SERVO_2_PIN, INPUT_PULLUP);
 
   pinMode(THROTTLE_PIN, INPUT);
-  pinMode(THERMISTOR_PIN, INPUT);
-  pinMode(RADIATOR_FAN_PIN, OUTPUT);
+//  pinMode(THERMISTOR_PIN, INPUT);
+//  pinMode(RADIATOR_FAN_PIN, OUTPUT);
   pinMode(LED_BUILTIN, OUTPUT);
-
-  Serial.begin(9600);
-  Serial.println("Thermistor");
 
 //  attachInterrupt(digitalPinToInterrupt(SERVO_1_PIN), pulse_timer_1_rising, HIGH);
 //  attachInterrupt(digitalPinToInterrupt(SERVO_1_PIN), pulse_timer_1_falling, FALLING);
 
   dac.begin(0x60);
+//    dac.setVoltage(0, false);
+
+  bitSet(error_codes_set, ERROR_CODE_THROTTLE_INIT_VALUE);
+  Serial.println("Done");
 }
 
 // the loop function runs over and over again forever
 void loop() {
+
+//    Serial.println(motor_throttle * 100);
+//    Serial.print(" ");
+//    Serial.println(voltage);
+
+    throttle_callback();
+    thermostat_callback();
+    error_callback();
+    delay(500);
+}
+
+void throttle_callback() {
 //    throttle_mode = digitalRead(THROTTLE_MODE_PIN) == HIGH;
 
 //    if (throttle_mode == THROTTLE_MODE_CONSTANT) {
       motor_throttle = analogRead(THROTTLE_PIN) / 1023.0;
-      if (discard_throttle_value) {  // safe startup
+      
+      if (bitRead(error_codes_set, ERROR_CODE_THROTTLE_INIT_VALUE)) {  // safe startup
           if (motor_throttle == 0.0) {
-              discard_throttle_value = false;
+              bitClear(error_codes_set, ERROR_CODE_THROTTLE_INIT_VALUE);
           } else {
               motor_throttle = 0.0;
           }
@@ -79,17 +106,11 @@ void loop() {
 
     dac.setVoltage(min(motor_throttle * 4095, 4095), false);
 
-
-//    Serial.println(motor_throttle * 100);
-//    Serial.print(" ");
-//    Serial.println(voltage);
-
-    thermostat();
-//    error_display();
-    delay(500);
+    Serial.print("THROTTLE: ");
+    Serial.println(motor_throttle);
 }
 
-void thermostat() {
+void thermostat_callback() {
     uint8_t i;
     
     thermistor_reading = 0.0;
@@ -109,37 +130,61 @@ void thermostat() {
     steinhart += 1.0 / (TEMPERATURE_NOMINAL + 273.15); // + (1/To)
     oil_temperature = 1.0 / steinhart - 273.15;
 
-    temperature_value_out_of_bounds = (oil_temperature < THERMISTOR_MIN_TEMP || oil_temperature > THERMISTOR_MAX_TEMP);
+    bitWrite(error_codes_set, ERROR_CODE_THERMISTOR_RANGE, oil_temperature < THERMISTOR_MIN_TEMP || oil_temperature > THERMISTOR_MAX_TEMP);
 
     fan_speed = min(1.0, max(0.0, oil_temperature - RADIATOR_FAN_OFF_TEMP) / (RADIATOR_FAN_ON_TEMP - RADIATOR_FAN_OFF_TEMP));
     analogWrite(RADIATOR_FAN_PIN, fan_speed * 255.0);
 
+    Serial.print("FAN SPEED: ");
     Serial.print(fan_speed);
-    Serial.print(" ");
+    Serial.print(" OIL TEMP: ");
     Serial.println(oil_temperature);
     
 }
 
-void error_display() {
-    if (temperature_value_out_of_bounds) {
-        display_error_code(3);
+void error_callback() {
+    int timer_interval = millis() - error_timer;
+
+    if (
+        (current_error_bit == 0 && current_error_blink_counter == 0 && timer_interval < ERROR_CODE_CYCLE_RESTART_DELAY)  // error cycle restarts
+        || (current_error_blink_counter == 0 && timer_interval < ERROR_CODE_CYCLE_DELAY)  // done reporting error
+        || (current_error_blink_counter > 0 && timer_interval < ERROR_CODE_BLINK_DELAY)  // reporting error
+    ) {
+        return;  // sleep
     }
-    if (discard_throttle_value) {
-        display_error_code(4);
+
+    error_timer = millis();
+
+    Serial.print("ERROR BITMAP: ");
+    Serial.println(error_codes_set);
+  
+    while (true) {
+        if (current_error_blink_counter > 0 || bitRead(error_codes_set, current_error_bit)) {
+//            Serial.print("BIT SET: ");
+//            Serial.print(current_error_bit);
+//            Serial.print(" BLINK STEP: ");
+//            Serial.print(current_error_blink_counter);
+            if (current_error_blink_counter % 2 == 0) {
+                digitalWrite(LED_BUILTIN, HIGH);
+//                Serial.println("HIGH");
+            } else {
+                digitalWrite(LED_BUILTIN, LOW);
+//                Serial.println("LOW");
+            }
+            if (++current_error_blink_counter >= (current_error_bit + 1) * 2) {
+                current_error_blink_counter = 0;
+                current_error_bit++;
+            }
+            break;
+        }
+
+        if (++current_error_bit >= ERROR_CODE_BITS) {
+            current_error_bit = 0;
+            break;
+        }
     }
 }
 
-void display_error_code(uint8_t code) {
-    uint8_t i;
-    Serial.print("Error code: ");
-    Serial.println(code);
-    for (i = 0; i < code; i++) {
-        digitalWrite(LED_BUILTIN, HIGH);
-        delay(250);
-        digitalWrite(LED_BUILTIN, LOW);
-        delay(250);
-    }
-}
 
 bool pulse_timer_rising(int pin) {
   servo_start_timer[pin] = micros();
